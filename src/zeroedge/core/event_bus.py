@@ -1,4 +1,4 @@
-class EventBus:
+class SyncEventBus:
     def __init__(self):
         self.handlers = {}
     def subscribe(self, event, handler):

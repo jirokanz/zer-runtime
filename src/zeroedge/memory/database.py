@@ -1,12 +1,81 @@
 import sqlite3
+
 class MemoryDatabase:
     def __init__(self, path=":memory:"):
         self.conn = sqlite3.connect(path)
-        self.conn.execute("CREATE TABLE IF NOT EXISTS tasks (id TEXT, goal TEXT, success BOOLEAN)")
-    def record_task(self, id, goal, success=False):
-        self.conn.execute("INSERT OR REPLACE INTO tasks VALUES (?, ?, ?)", (id, goal, success))
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                id TEXT PRIMARY KEY,
+                goal TEXT,
+                success BOOLEAN,
+                replay_count INTEGER DEFAULT 0,
+                replay_success_count INTEGER DEFAULT 0,
+                archived BOOLEAN DEFAULT 0,
+                metadata TEXT
+            )
+        """)
         self.conn.commit()
-    def get_task(self, id):
-        cur = self.conn.execute("SELECT * FROM tasks WHERE id=?", (id,))
+
+    def record_task(self, task_id, goal, success=False, workspace_path=None):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO tasks (id, goal, success) VALUES (?, ?, ?)",
+            (task_id, goal, success)
+        )
+        self.conn.commit()
+
+    def get_task(self, task_id):
+        cur = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,))
         row = cur.fetchone()
-        return {"id": row[0], "goal": row[1], "success": row[2]} if row else None
+        if row:
+            return {
+                "id": row[0],
+                "goal": row[1],
+                "success": row[2],
+                "replay_count": row[3],
+                "replay_success_count": row[4],
+                "archived": row[5],
+                "metadata": row[6]
+            }
+        return None
+
+    def find_similar_goals(self, goal, limit=3):
+        words = set(goal.lower().split())
+        cursor = self.conn.execute("SELECT id, goal, success, replay_count, replay_success_count FROM tasks")
+        candidates = []
+        for row in cursor.fetchall():
+            task_words = set(row[1].lower().split())
+            similarity = len(words & task_words) / len(words | task_words) if words else 0
+            if similarity > 0.3:
+                candidates.append({
+                    "id": row[0],
+                    "goal": row[1],
+                    "success": row[2],
+                    "replay_count": row[3],
+                    "replay_success_count": row[4],
+                    "similarity": similarity
+                })
+        candidates.sort(key=lambda x: x["similarity"], reverse=True)
+        return candidates[:limit]
+
+    def update_task_metadata(self, task_id, metadata):
+        import json
+        self.conn.execute(
+            "UPDATE tasks SET metadata = ? WHERE id = ?",
+            (json.dumps(metadata), task_id)
+        )
+        self.conn.commit()
+
+    def register_replay_attempt(self, task_id):
+        self.conn.execute(
+            "UPDATE tasks SET replay_count = replay_count + 1 WHERE id = ?",
+            (task_id,)
+        )
+        self.conn.commit()
+
+    def register_replay_result(self, task_id, success):
+        if success:
+            self.conn.execute(
+                "UPDATE tasks SET replay_success_count = replay_success_count + 1 WHERE id = ?",
+                (task_id,)
+            )
+        self.conn.commit()
