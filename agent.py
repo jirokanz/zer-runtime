@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-ZeroEdgeAI ZER Runtime – Autonomous Agent Runtime
-Full integration of memory, replay, tools, workspace, and reasoning loop.
+ZeroEdgeAI ZER Runtime – Fully Autonomous Agent
+Fixed: strips markdown from generated code, handles truncation, full loop.
 """
 
 import os
 import sys
+import re
 import json
 import time
 import sqlite3
@@ -19,11 +20,21 @@ import litellm
 
 load_dotenv()
 
+# ---------- Code Extraction ----------
+def extract_code(text):
+    """Extract Python code from markdown code blocks."""
+    # Try to find ```python ... ``` or ``` ... ```
+    match = re.search(r"```(?:python)?\n(.*?)\n```", text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    # If no markdown, assume the whole text is code
+    return text.strip()
+
 # ---------- Configuration ----------
 DB_PATH = "memory.db"
 WORKSPACE_ROOT = Path.home() / "zer-runtime" / "workspace"
 MAX_FIX_ATTEMPTS = 3
-EXECUTION_TIMEOUT = 15
+EXECUTION_TIMEOUT = 20
 STATE_IDLE = "IDLE"
 STATE_PLANNING = "PLANNING"
 STATE_CODING = "CODING"
@@ -181,14 +192,12 @@ class WorkspaceManager:
         return plan_path
 
     def clone_workspace(self, source_task_id, new_task_id):
-        """Clone a workspace from a previous task."""
         source_path = self.root / f"task_{source_task_id}"
         if not source_path.exists():
             return None
         new_path = self.root / f"task_{new_task_id}"
         import shutil
         shutil.copytree(source_path, new_path)
-        # Remove old execution logs to start fresh
         exec_file = new_path / "execution.json"
         if exec_file.exists():
             exec_file.unlink()
@@ -201,21 +210,16 @@ class ReplayManager:
         self.workspace = workspace_manager
 
     def replay_task(self, source_task_id, new_goal):
-        """Clone a previous successful task and prepare it for re-execution."""
         original = self.memory_db.find_similar(new_goal)
         if not original:
             return None
-        # Generate new task ID
         new_task_id = f"replay_{uuid.uuid4().hex[:8]}"
-        # Clone workspace
         new_workspace = self.workspace.clone_workspace(source_task_id, new_task_id)
         if not new_workspace:
             return None
-        # Copy the code from original
         code = original.get("code")
         if code:
             self.workspace.save_code(new_workspace, code)
-        # Record new task in memory (as replay)
         self.memory_db.save_task(
             task_id=new_task_id,
             goal=new_goal,
@@ -224,7 +228,7 @@ class ReplayManager:
             answer=None,
             provider=original.get("provider"),
             workspace_path=str(new_workspace),
-            success=False  # will be updated after execution
+            success=False
         )
         return {
             "task_id": new_task_id,
@@ -232,22 +236,21 @@ class ReplayManager:
             "code": code
         }
 
-# ---------- Memory Router (Simplified) ----------
+# ---------- Memory Router ----------
 class MemoryRouter:
     def __init__(self, memory_db):
         self.db = memory_db
 
     def route(self, goal):
-        """Return 'reuse', 'adapt', or 'regenerate' based on similarity."""
         cached = self.db.find_similar(goal)
         if cached:
-            # Simple confidence: if similarity is high, reuse; otherwise adapt
-            # For now, we always reuse if found (we'll add confidence later)
             return {"decision": "reuse", "candidate": cached}
         return {"decision": "regenerate", "candidate": None}
 
 # ---------- Execution & Auto-Fix ----------
 def execute_code(code, timeout=EXECUTION_TIMEOUT):
+    # Strip any lingering markdown
+    code = extract_code(code)
     with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
         f.write(code)
         fname = f.name
@@ -266,18 +269,19 @@ def execute_code(code, timeout=EXECUTION_TIMEOUT):
     return stdout, stderr, exit_code
 
 def run_with_autofix(goal, plan, coder, workspace, memory_db, task_id):
-    """Generate code, execute, and fix if needed."""
     code = None
     last_stderr = None
+    provider = None
     for attempt in range(MAX_FIX_ATTEMPTS):
         if attempt == 0:
             print("💻 Generating code...")
             try:
                 result = coder.generate(
                     f"Write Python code for this goal:\nGoal: {goal}\nPlan: {plan}\n\nOutput only the code, no explanation.",
-                    max_tokens=768
+                    max_tokens=1024
                 )
-                code = result["content"]
+                raw = result["content"]
+                code = extract_code(raw)
                 print(f"   (Provider: {result['provider']}, tokens: {result['total_tokens']})")
                 provider = result['provider']
             except Exception as e:
@@ -296,16 +300,18 @@ Original code:
 Please fix the code and output only the corrected code.
 """
             try:
-                result = coder.generate(fix_prompt, max_tokens=768)
-                code = result["content"]
+                result = coder.generate(fix_prompt, max_tokens=1024)
+                raw = result["content"]
+                code = extract_code(raw)
                 print(f"   (Provider: {result['provider']}, tokens: {result['total_tokens']})")
                 provider = result['provider']
             except Exception as e:
                 print(f"❌ Fix generation failed: {e}")
                 return None, None, None, None
 
-        # Save the code to workspace
-        workspace.save_code(workspace.root / f"task_{task_id}", code)
+        # Save code to workspace
+        ws_path = workspace.root / f"task_{task_id}"
+        workspace.save_code(ws_path, code)
 
         # Execute
         print("▶️  Executing...")
@@ -313,8 +319,7 @@ Please fix the code and output only the corrected code.
 
         if exit_code == 0:
             print("✅ Execution succeeded.")
-            # Save execution log
-            workspace.save_execution(workspace.root / f"task_{task_id}", stdout, stderr, exit_code)
+            workspace.save_execution(ws_path, stdout, stderr, exit_code)
             return code, stdout, stderr, provider
         else:
             print(f"❌ Execution failed (exit code {exit_code})")
@@ -323,8 +328,7 @@ Please fix the code and output only the corrected code.
             else:
                 print("   (No stderr captured)")
             last_stderr = stderr or "Unknown error (no output)"
-            # Save failed execution log
-            workspace.save_execution(workspace.root / f"task_{task_id}", stdout, stderr, exit_code)
+            workspace.save_execution(ws_path, stdout, stderr, exit_code)
 
     print("❌ Max fix attempts reached.")
     return None, None, None, None
@@ -332,7 +336,6 @@ Please fix the code and output only the corrected code.
 # ---------- Build Provider Registry ----------
 registry = ProviderRegistry()
 
-# Register all providers from .env
 def register_provider(name, model, api_base, key_env, capabilities, priority):
     key = os.getenv(key_env)
     if key:
@@ -372,14 +375,12 @@ for p in registry.providers:
 
 # ---------- Main Agent ----------
 def main():
-    print("\n🤖 ZeroEdgeAI ZER Runtime – Autonomous Agent\n")
+    print("\n🤖 ZeroEdgeAI ZER Runtime – Fully Autonomous Agent\n")
 
     memory_db = MemoryDB(DB_PATH)
     workspace = WorkspaceManager()
     router = MemoryRouter(memory_db)
     replay_manager = ReplayManager(memory_db, workspace)
-
-    state = STATE_IDLE
 
     while True:
         goal = input("💬 Your goal/question: ").strip()
@@ -387,9 +388,8 @@ def main():
             print("👋 Bye!")
             break
 
-        # Generate task ID
         task_id = f"task_{uuid.uuid4().hex[:8]}"
-        state = STATE_IDLE
+        ws_path = workspace.create_workspace(task_id)
 
         # 1. Memory check
         decision = router.route(goal)
@@ -398,19 +398,14 @@ def main():
             print("\n💾 Found memory!")
             print(f"   Goal: {cached['goal']}")
             print(f"   Provider: {cached['provider']}")
-
-            # Option: replay directly if confidence is high
-            # For now, we offer choice
             print("🔄 Replaying previous solution...")
             replay_result = replay_manager.replay_task(cached.get("id"), goal)
             if replay_result:
-                # Execute the replayed code
                 code = replay_result["code"]
                 stdout, stderr, exit_code = execute_code(code)
                 if exit_code == 0:
                     print("✅ Replay succeeded.")
                     print(f"Output:\n{stdout}")
-                    # Mark as success in memory
                     memory_db.save_task(
                         task_id=replay_result["task_id"],
                         goal=goal,
@@ -421,19 +416,16 @@ def main():
                         workspace_path=replay_result["workspace_path"],
                         success=True
                     )
-                    state = STATE_COMPLETED
                     continue
                 else:
                     print("⚠️ Replay failed, falling back to fresh generation.")
-                    # Fall through to fresh generation
 
         # 2. Question vs Task detection
         question_keywords = ["what", "how", "why", "when", "where", "who", "is", "are", "can", "do", "does", "will", "would", "could", "should"]
         is_question = any(goal.lower().startswith(kw) for kw in question_keywords) and len(goal.split()) > 2
 
         if is_question:
-            state = "ANSWERING"
-            # Answering
+            # Answering mode
             candidates = registry.get_all("answering")
             if not candidates:
                 print("❌ No provider for answering.")
@@ -457,7 +449,7 @@ def main():
                         code=None,
                         answer=answer,
                         provider=provider.name,
-                        workspace_path=None,
+                        workspace_path=str(ws_path),
                         success=True
                     )
                     print("💾 Saved to memory.")
@@ -471,7 +463,6 @@ def main():
             continue
 
         # 3. Task mode – Planning + Code with auto-fix
-        state = STATE_PLANNING
         planner = registry.get_best("planning")
         if not planner:
             print("❌ No provider for planning.")
@@ -481,19 +472,16 @@ def main():
         try:
             result = planner.generate(
                 f"Create a short, clear, numbered plan for: {goal}",
-                max_tokens=512
+                max_tokens=1024  # increased from 512
             )
             plan = result["content"]
             print(f"\n📋 Plan:\n{plan}")
             print(f"   (Provider: {result['provider']}, tokens: {result['total_tokens']})")
-            # Save plan to workspace
-            ws_path = workspace.create_workspace(task_id)
             workspace.save_plan(ws_path, plan)
         except Exception as e:
             print(f"❌ Error: {e}")
             continue
 
-        state = STATE_CODING
         coder = registry.get_best("coding")
         if not coder:
             print("❌ No provider for coding.")
@@ -503,10 +491,8 @@ def main():
         code, stdout, stderr, provider = run_with_autofix(goal, plan, coder, workspace, memory_db, task_id)
 
         if code and stdout is not None:
-            state = STATE_COMPLETED
             print("\n✅ Task completed successfully.")
             print(f"Output:\n{stdout}")
-            # Store in memory with success
             memory_db.save_task(
                 task_id=task_id,
                 goal=goal,
@@ -519,9 +505,7 @@ def main():
             )
             print("💾 Saved to memory.")
         else:
-            state = STATE_FAILED
             print("\n❌ Task failed after multiple attempts.")
-            # Store failure
             memory_db.save_task(
                 task_id=task_id,
                 goal=goal,
@@ -529,7 +513,7 @@ def main():
                 code=code if code else "",
                 answer=f"FAILED: {stderr if stderr else 'Unknown error'}",
                 provider=provider if provider else "unknown",
-                workspace_path=str(ws_path) if 'ws_path' in locals() else None,
+                workspace_path=str(ws_path),
                 success=False
             )
 
