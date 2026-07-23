@@ -138,3 +138,59 @@ def test_config_missing_file_falls_back_to_default():
     from zeroedge.core.config import Config
     cfg = Config("/nonexistent/path.yaml")
     assert cfg.get("anything", "fallback") == "fallback"
+
+
+# ---- adaptive provider ranking (was static priority only, never updated) ----
+
+def test_provider_stats_recorded_and_retrieved(tmp_path):
+    from zeroedge.agent import MemoryDB
+    db = MemoryDB(str(tmp_path / "mem.db"))
+    db.record_provider_call("groq", "coding", True, 500)
+    db.record_provider_call("groq", "coding", True, 700)
+    db.record_provider_call("groq", "coding", False, 900)
+    stats = db.get_provider_stats("groq", "coding")
+    assert stats["calls"] == 3
+    assert stats["successes"] == 2
+    assert stats["total_latency_ms"] == 2100
+
+
+def test_registry_falls_back_to_static_priority_below_min_samples(tmp_path):
+    from zeroedge.agent import MemoryDB, BaseProvider, ProviderRegistry
+    db = MemoryDB(str(tmp_path / "mem.db"))
+    registry = ProviderRegistry()
+    fast_but_new = BaseProvider("fast", "m", "", "k", ["coding"], priority=50)
+    slow_but_established = BaseProvider("slow", "m", "", "k", ["coding"], priority=10)
+    registry.register(fast_but_new)
+    registry.register(slow_but_established)
+    # Only 1 data point for "fast" -- below MIN_SAMPLES, so static priority
+    # (lower number wins) should still decide the ranking.
+    db.record_provider_call("fast", "coding", True, 100)
+    best = registry.get_best("coding", memory_db=db)
+    assert best.name == "slow"
+
+
+def test_registry_prefers_measured_success_once_enough_samples(tmp_path):
+    from zeroedge.agent import MemoryDB, BaseProvider, ProviderRegistry
+    db = MemoryDB(str(tmp_path / "mem.db"))
+    registry = ProviderRegistry()
+    unreliable_but_prioritized = BaseProvider("unreliable", "m", "", "k", ["coding"], priority=10)
+    reliable_but_deprioritized = BaseProvider("reliable", "m", "", "k", ["coding"], priority=90)
+    registry.register(unreliable_but_prioritized)
+    registry.register(reliable_but_deprioritized)
+
+    for _ in range(10):
+        db.record_provider_call("unreliable", "coding", False, 200)
+    for _ in range(10):
+        db.record_provider_call("reliable", "coding", True, 200)
+
+    best = registry.get_best("coding", memory_db=db)
+    assert best.name == "reliable"
+
+
+def test_registry_with_no_memory_db_uses_static_priority():
+    from zeroedge.agent import BaseProvider, ProviderRegistry
+    registry = ProviderRegistry()
+    registry.register(BaseProvider("b", "m", "", "k", ["coding"], priority=50))
+    registry.register(BaseProvider("a", "m", "", "k", ["coding"], priority=10))
+    best = registry.get_best("coding")  # no memory_db passed
+    assert best.name == "a"

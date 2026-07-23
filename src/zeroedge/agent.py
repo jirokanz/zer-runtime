@@ -176,22 +176,40 @@ class BaseProvider:
 
 
 class ProviderRegistry:
+    MIN_SAMPLES = 4          # below this, trust the static priority (cold start)
+    LATENCY_PENALTY_PER_SEC = 5  # score points lost per second of avg latency
+
     def __init__(self):
         self.providers = []
 
     def register(self, provider):
         self.providers.append(provider)
 
-    def get_best(self, capability):
+    def _score(self, provider, capability, memory_db):
+        """Higher is better. Blends measured success rate + latency with the
+        static priority as a prior, so a provider with few/no data points
+        still ranks the same as the old hardcoded-priority behavior."""
+        static_score = 1000 - provider.priority  # invert: lower priority number = higher score
+        if memory_db is None:
+            return static_score
+        stats = memory_db.get_provider_stats(provider.name, capability)
+        if not stats or stats["calls"] < self.MIN_SAMPLES:
+            return static_score
+        success_rate = stats["successes"] / stats["calls"]
+        avg_latency_s = stats["total_latency_ms"] / stats["calls"] / 1000
+        # success rate dominates (0-100 range), latency is a tie-breaking penalty
+        return (success_rate * 100) - (avg_latency_s * self.LATENCY_PENALTY_PER_SEC)
+
+    def get_best(self, capability, memory_db=None):
         candidates = [p for p in self.providers if capability in p.capabilities]
         if not candidates:
             return None
-        candidates.sort(key=lambda p: p.priority)
+        candidates.sort(key=lambda p: self._score(p, capability, memory_db), reverse=True)
         return candidates[0]
 
-    def get_all(self, capability):
+    def get_all(self, capability, memory_db=None):
         candidates = [p for p in self.providers if capability in p.capabilities]
-        candidates.sort(key=lambda p: p.priority)
+        candidates.sort(key=lambda p: self._score(p, capability, memory_db), reverse=True)
         return candidates
 
 
@@ -214,6 +232,16 @@ class MemoryDB:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS provider_stats (
+                provider TEXT,
+                capability TEXT,
+                calls INTEGER DEFAULT 0,
+                successes INTEGER DEFAULT 0,
+                total_latency_ms REAL DEFAULT 0,
+                PRIMARY KEY (provider, capability)
+            )
+        """)
         self.conn.commit()
         self._migrate()
 
@@ -228,6 +256,35 @@ class MemoryDB:
             if col not in existing:
                 self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {col_type}")
                 self.conn.commit()
+
+    def record_provider_call(self, provider, capability, success, latency_ms):
+        self.conn.execute(
+            "INSERT INTO provider_stats (provider, capability, calls, successes, total_latency_ms) "
+            "VALUES (?, ?, 1, ?, ?) "
+            "ON CONFLICT(provider, capability) DO UPDATE SET "
+            "calls = calls + 1, "
+            "successes = successes + ?, "
+            "total_latency_ms = total_latency_ms + ?",
+            (provider, capability, int(success), latency_ms, int(success), latency_ms),
+        )
+        self.conn.commit()
+
+    def get_provider_stats(self, provider, capability):
+        cur = self.conn.execute(
+            "SELECT calls, successes, total_latency_ms FROM provider_stats WHERE provider=? AND capability=?",
+            (provider, capability),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {"calls": row[0], "successes": row[1], "total_latency_ms": row[2]}
+
+    def get_all_provider_stats(self):
+        cur = self.conn.execute("SELECT provider, capability, calls, successes, total_latency_ms FROM provider_stats")
+        return [
+            {"provider": r[0], "capability": r[1], "calls": r[2], "successes": r[3], "total_latency_ms": r[4]}
+            for r in cur.fetchall()
+        ]
 
     def find_similar(self, goal):
         words = set(goal.lower().split())
@@ -392,15 +449,21 @@ def show_diff(old_code, new_code):
 
 
 def stream_generate(provider, prompt, system_prompt=None, max_tokens=1024, history=None,
-                     label="Generating", render="text"):
+                     label="Generating", render="text", memory_db=None, capability=None):
     """Streams from the provider as it's produced (vibe-coding feel).
     render='text'  -> print raw chunks live (good for prose: plans, answers)
     render='code'  -> print a lightweight progress indicator instead of raw
                        chunks, and let the caller show a formatted code box
                        once generation is complete (avoids dumping raw,
                        unhighlighted, possibly-mid-fence text to the screen
-                       and then immediately re-printing the same code)."""
+                       and then immediately re-printing the same code).
+    If memory_db + capability are given, records success/latency so
+    ProviderRegistry can rank providers by measured performance instead
+    of only the static hardcoded priority."""
+    import time
     print(f"{_c(f'   [{provider.name}] {label}...', 'cyan')}")
+    start = time.monotonic()
+    success = False
     try:
         chunks = []
         dots = 0
@@ -416,12 +479,24 @@ def stream_generate(provider, prompt, system_prompt=None, max_tokens=1024, histo
             print("\n")
         else:
             print(" done\n")
+        success = True
         return "".join(chunks)
     except Exception:
-        result = provider.generate(prompt, system_prompt, max_tokens, history)
-        if render == "text":
-            print(result["content"] + "\n")
-        return result["content"]
+        try:
+            result = provider.generate(prompt, system_prompt, max_tokens, history)
+            if render == "text":
+                print(result["content"] + "\n")
+            success = True
+            return result["content"]
+        except Exception:
+            raise
+    finally:
+        if memory_db is not None and capability is not None:
+            latency_ms = (time.monotonic() - start) * 1000
+            try:
+                memory_db.record_provider_call(provider.name, capability, success, latency_ms)
+            except Exception:
+                pass  # stats tracking should never break the actual task
 
 
 def ask_action(prompt="What next?", options=("r", "e", "f", "s")):
@@ -452,7 +527,7 @@ def run_with_autofix_interactive(goal, plan, coder, workspace, memory_db, task_i
     ws_path = workspace.root / f"task_{task_id}"
 
     gen_prompt = f"Write Python code for this goal:\nGoal: {goal}\nPlan: {plan}\n\nOutput only the code, no explanation."
-    raw = stream_generate(coder, gen_prompt, max_tokens=1024, label="Generating code", render="code")
+    raw = stream_generate(coder, gen_prompt, max_tokens=1024, label="Generating code", render="code", memory_db=memory_db, capability="coding")
     code = extract_code(raw)
     provider = coder.name
     history.append({"role": "user", "content": gen_prompt})
@@ -480,7 +555,7 @@ def run_with_autofix_interactive(goal, plan, coder, workspace, memory_db, task_i
         if action == "f":
             feedback = input("What should change? ").strip()
             fix_prompt = f"The current code for goal '{goal}' needs this change:\n{feedback}\n\nCurrent code:\n{code}\n\nOutput only the corrected full code."
-            raw = stream_generate(coder, fix_prompt, max_tokens=1024, history=history, label="Applying feedback", render="code")
+            raw = stream_generate(coder, fix_prompt, max_tokens=1024, history=history, label="Applying feedback", render="code", memory_db=memory_db, capability="coding")
             new_code = extract_code(raw)
             print("Diff vs. previous version:")
             show_diff(code, new_code)
@@ -512,7 +587,7 @@ def run_with_autofix_interactive(goal, plan, coder, workspace, memory_db, task_i
                 break
 
             fix_prompt = f"The Python code for goal '{goal}' failed:\n\n{stderr}\n\nCurrent code:\n{code}\n\nOutput only the corrected code."
-            raw = stream_generate(coder, fix_prompt, max_tokens=1024, history=history, label=f"Auto-fixing (attempt {attempt + 1})", render="code")
+            raw = stream_generate(coder, fix_prompt, max_tokens=1024, history=history, label=f"Auto-fixing (attempt {attempt + 1})", render="code", memory_db=memory_db, capability="coding")
             new_code = extract_code(raw)
             show_diff(code, new_code)
             history.append({"role": "user", "content": fix_prompt})
@@ -524,6 +599,27 @@ def run_with_autofix_interactive(goal, plan, coder, workspace, memory_db, task_i
 
 
 # ---------- Provider registry ----------
+def print_provider_rankings(registry, memory_db):
+    print(f"\n{_c('Provider rankings (measured performance, falls back to static priority until ' + str(ProviderRegistry.MIN_SAMPLES) + '+ calls):', 'bold')}")
+    capabilities = sorted({cap for p in registry.providers for cap in p.capabilities})
+    for cap in capabilities:
+        candidates = registry.get_all(cap, memory_db=memory_db)
+        if not candidates:
+            continue
+        print(f"\n  {_c(cap, 'cyan')}:")
+        for rank, p in enumerate(candidates, 1):
+            stats = memory_db.get_provider_stats(p.name, cap)
+            if stats and stats["calls"] >= ProviderRegistry.MIN_SAMPLES:
+                rate = stats["successes"] / stats["calls"] * 100
+                avg_ms = stats["total_latency_ms"] / stats["calls"]
+                detail = f"{rate:.0f}% success, {avg_ms:.0f}ms avg over {stats['calls']} calls"
+            elif stats:
+                detail = f"only {stats['calls']} calls so far -- using static priority ({p.priority})"
+            else:
+                detail = f"no data yet -- using static priority ({p.priority})"
+            print(f"    {rank}. {p.name:12s} {_c(detail, 'grey')}")
+
+
 def build_registry():
     registry = ProviderRegistry()
 
@@ -561,12 +657,15 @@ def main():
     replay_manager = ReplayManager(memory_db, workspace)
 
     while True:
-        goal = input("\nYour goal/question (or 'exit'): ").strip()
+        goal = input("\nYour goal/question (or 'exit', or 'providers' to see rankings): ").strip()
         if not goal:
             continue
         if goal.lower() in ("exit", "quit"):
             print("Bye!")
             break
+        if goal.lower() == "providers":
+            print_provider_rankings(registry, memory_db)
+            continue
 
         task_id = f"task_{uuid.uuid4().hex[:8]}"
 
@@ -599,7 +698,7 @@ def main():
         is_question = any(goal.lower().startswith(kw) for kw in question_keywords) and len(goal.split()) > 2
 
         if is_question:
-            candidates = registry.get_all("answering")
+            candidates = registry.get_all("answering", memory_db=memory_db)
             if not candidates:
                 print("No provider configured for answering.")
                 continue
@@ -609,6 +708,7 @@ def main():
                         provider, goal,
                         system_prompt="You are a helpful assistant. Answer concisely and accurately.",
                         max_tokens=512, label="Thinking",
+                        memory_db=memory_db, capability="answering",
                     )
                     memory_db.save_task(task_id=task_id, goal=goal, plan=None, code=None,
                                          answer=answer, provider=provider.name,
@@ -620,14 +720,14 @@ def main():
             continue
 
         ws_path = workspace.create_workspace(task_id)
-        planner = registry.get_best("planning")
-        coder = registry.get_best("coding")
+        planner = registry.get_best("planning", memory_db=memory_db)
+        coder = registry.get_best("coding", memory_db=memory_db)
         if not planner or not coder:
             print("No provider configured for planning/coding.")
             continue
 
         plan = stream_generate(planner, f"Create a short, clear, numbered plan for: {goal}",
-                                max_tokens=1024, label="Planning")
+                                max_tokens=1024, label="Planning", memory_db=memory_db, capability="planning")
         workspace.save_plan(ws_path, plan)
 
         code, stdout, stderr, provider = run_with_autofix_interactive(goal, plan, coder, workspace, memory_db, task_id)
