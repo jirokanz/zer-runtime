@@ -704,17 +704,17 @@ def build_registry():
             return True
         return False
 
-    # Groq: fast general-purpose model -- best fit for planning, where low
-    # latency matters more than coding depth. Explicitly deprioritized for
-    # coding (capability_priority) in favor of DeepSeek below.
+    # Groq: fast general-purpose model, primary for both planning and
+    # coding for now.
     register_provider("groq", "groq/llama-3.3-70b-versatile", "https://api.groq.com/openai/v1",
-                       "GROQ_API_KEY", ["planning", "coding"], priority=10,
-                       capability_priority={"coding": 25})
-    # DeepSeek: model family specifically strong at code generation --
-    # made the top pick for coding, kept behind Groq for planning.
-    register_provider("deepseek", "deepseek/deepseek-chat", "https://api.deepseek.com/v1",
-                       "DEEPSEEK_API_KEY", ["coding", "planning"], priority=20,
-                       capability_priority={"coding": 5})
+                       "GROQ_API_KEY", ["planning", "coding"], priority=10)
+    # DeepSeek removed for now -- not actually free (per-token paid API),
+    # so it shouldn't be a default in a "free/cheap providers" pool.
+    # Re-add with capability_priority={"coding": 5} on groq's coding entry
+    # dropped to e.g. 25 if you want it back as the specialized coder later:
+    # register_provider("deepseek", "deepseek/deepseek-chat", "https://api.deepseek.com/v1",
+    #                    "DEEPSEEK_API_KEY", ["coding", "planning"], priority=20,
+    #                    capability_priority={"coding": 5})
     register_provider("openrouter", "openrouter/meta-llama/llama-3.1-70b-instruct", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", ["answering", "planning"], 30)
     register_provider("gemini", "gemini/gemini-2.0-flash", "https://generativelanguage.googleapis.com/v1beta/openai/", "GEMINI_API_KEY", ["answering", "validation"], 40)
     register_provider("nvidia", "nvidia/llama-3.1-70b-instruct", "https://integrate.api.nvidia.com/v1", "NVIDIA_API_KEY", ["planning", "coding"], 50)
