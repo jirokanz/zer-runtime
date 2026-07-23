@@ -31,6 +31,9 @@ import litellm
 litellm.suppress_debug_info = True
 litellm.set_verbose = False
 
+import logging
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+
 from zeroedge.tools.python.security import validate_code as static_validate_code
 from zeroedge.tools.python.limits import make_preexec_fn, enforce_output_limit
 
