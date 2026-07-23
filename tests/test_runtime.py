@@ -194,3 +194,63 @@ def test_registry_with_no_memory_db_uses_static_priority():
     registry.register(BaseProvider("a", "m", "", "k", ["coding"], priority=10))
     best = registry.get_best("coding")  # no memory_db passed
     assert best.name == "a"
+
+
+# ---- session continuation detection (was misrouting follow-ups to coding) ----
+
+def test_followup_without_action_verb_routes_to_answering():
+    from zeroedge.agent import SessionContext, is_question_or_followup
+    session = SessionContext()
+    session.add("what is the best for coding?", "answer", "VS Code, PyCharm, etc.")
+    # This is the exact phrase that got misrouted in practice.
+    assert is_question_or_followup("in term of ai token provider?", session) is True
+
+
+def test_standalone_action_request_routes_to_coding():
+    from zeroedge.agent import SessionContext, is_question_or_followup
+    session = SessionContext()
+    assert is_question_or_followup("write a script to check disk usage", session) is False
+
+
+def test_plain_question_still_detected():
+    from zeroedge.agent import SessionContext, is_question_or_followup
+    session = SessionContext()
+    assert is_question_or_followup("what is the capital of France?", session) is True
+
+
+def test_session_context_rolls_and_resets():
+    from zeroedge.agent import SessionContext
+    session = SessionContext(max_turns=2)
+    session.add("goal1", "answer", "summary1")
+    session.add("goal2", "answer", "summary2")
+    session.add("goal3", "answer", "summary3")
+    assert len(session.turns) == 2
+    assert session.turns[0]["goal"] == "goal2"
+    session.reset()
+    assert session.turns == []
+    assert session.as_context() == ""
+
+
+# ---- per-capability priority override ----
+
+def test_provider_ranks_differently_per_capability():
+    from zeroedge.agent import BaseProvider, ProviderRegistry
+    registry = ProviderRegistry()
+    # groq: fast generalist, best for planning, deliberately worse for coding
+    groq = BaseProvider("groq", "m", "", "k", ["planning", "coding"], priority=10,
+                         capability_priority={"coding": 25})
+    # deepseek: code-specialized, made top pick for coding, ranked below groq for planning
+    deepseek = BaseProvider("deepseek", "m", "", "k", ["coding", "planning"], priority=20,
+                             capability_priority={"coding": 5})
+    registry.register(groq)
+    registry.register(deepseek)
+
+    assert registry.get_best("planning").name == "groq"
+    assert registry.get_best("coding").name == "deepseek"
+
+
+def test_priority_for_falls_back_to_default_priority():
+    from zeroedge.agent import BaseProvider
+    p = BaseProvider("x", "m", "", "k", ["a", "b"], priority=42, capability_priority={"a": 1})
+    assert p.priority_for("a") == 1
+    assert p.priority_for("b") == 42  # no override for "b" -- falls back to default

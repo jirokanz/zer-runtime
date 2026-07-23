@@ -118,13 +118,21 @@ def extract_code(text):
 
 # ---------- Provider ----------
 class BaseProvider:
-    def __init__(self, name, model, api_base, api_key, capabilities=None, priority=100):
+    def __init__(self, name, model, api_base, api_key, capabilities=None, priority=100,
+                 capability_priority=None):
         self.name = name
         self.model = model
         self.api_base = api_base
         self.api_key = api_key
         self.capabilities = capabilities or ["text_generation"]
         self.priority = priority
+        # Optional per-capability override, e.g. {"coding": 5} to rank this
+        # provider higher for coding specifically without changing its
+        # (possibly lower) rank for other capabilities it also serves.
+        self.capability_priority = capability_priority or {}
+
+    def priority_for(self, capability):
+        return self.capability_priority.get(capability, self.priority)
 
     def _messages(self, prompt, system_prompt, history):
         messages = []
@@ -189,7 +197,7 @@ class ProviderRegistry:
         """Higher is better. Blends measured success rate + latency with the
         static priority as a prior, so a provider with few/no data points
         still ranks the same as the old hardcoded-priority behavior."""
-        static_score = 1000 - provider.priority  # invert: lower priority number = higher score
+        static_score = 1000 - provider.priority_for(capability)  # invert: lower priority number = higher score
         if memory_db is None:
             return static_score
         stats = memory_db.get_provider_stats(provider.name, capability)
@@ -614,33 +622,103 @@ def print_provider_rankings(registry, memory_db):
                 avg_ms = stats["total_latency_ms"] / stats["calls"]
                 detail = f"{rate:.0f}% success, {avg_ms:.0f}ms avg over {stats['calls']} calls"
             elif stats:
-                detail = f"only {stats['calls']} calls so far -- using static priority ({p.priority})"
+                detail = f"only {stats['calls']} calls so far -- using static priority ({p.priority_for(cap)})"
             else:
-                detail = f"no data yet -- using static priority ({p.priority})"
+                detail = f"no data yet -- using static priority ({p.priority_for(cap)})"
             print(f"    {rank}. {p.name:12s} {_c(detail, 'grey')}")
 
 
 def build_registry():
     registry = ProviderRegistry()
 
-    def register_provider(name, model, api_base, key_env, capabilities, priority):
+    def register_provider(name, model, api_base, key_env, capabilities, priority, capability_priority=None):
         key = os.getenv(key_env)
         if key:
-            registry.register(BaseProvider(name, model, api_base, key, capabilities, priority))
+            registry.register(BaseProvider(name, model, api_base, key, capabilities, priority, capability_priority))
             return True
         return False
 
-    register_provider("groq", "groq/llama-3.3-70b-versatile", "https://api.groq.com/openai/v1", "GROQ_API_KEY", ["planning", "coding"], 10)
-    register_provider("deepseek", "deepseek/deepseek-chat", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", ["coding", "planning"], 20)
+    # Groq: fast general-purpose model -- best fit for planning, where low
+    # latency matters more than coding depth. Explicitly deprioritized for
+    # coding (capability_priority) in favor of DeepSeek below.
+    register_provider("groq", "groq/llama-3.3-70b-versatile", "https://api.groq.com/openai/v1",
+                       "GROQ_API_KEY", ["planning", "coding"], priority=10,
+                       capability_priority={"coding": 25})
+    # DeepSeek: model family specifically strong at code generation --
+    # made the top pick for coding, kept behind Groq for planning.
+    register_provider("deepseek", "deepseek/deepseek-chat", "https://api.deepseek.com/v1",
+                       "DEEPSEEK_API_KEY", ["coding", "planning"], priority=20,
+                       capability_priority={"coding": 5})
     register_provider("openrouter", "openrouter/meta-llama/llama-3.1-70b-instruct", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", ["answering", "planning"], 30)
     register_provider("gemini", "gemini/gemini-2.0-flash", "https://generativelanguage.googleapis.com/v1beta/openai/", "GEMINI_API_KEY", ["answering", "validation"], 40)
     register_provider("nvidia", "nvidia/llama-3.1-70b-instruct", "https://integrate.api.nvidia.com/v1", "NVIDIA_API_KEY", ["planning", "coding"], 50)
-    register_provider("cerebras", "cerebras/llama3.1-8b", "https://api.cerebras.ai/v1", "CEREBRAS_API_KEY", ["answering"], 60)
-    register_provider("mistral", "mistral/mistral-tiny", "https://api.mistral.ai/v1", "MISTRAL_API_KEY", ["answering"], 70)
+    # Upgraded from llama3.1-8b -- an 8B model was too weak to be a
+    # meaningful answering fallback; 70B is Cerebras's strong offering.
+    register_provider("cerebras", "cerebras/llama-3.3-70b", "https://api.cerebras.ai/v1", "CEREBRAS_API_KEY", ["answering"], 60)
+    register_provider("mistral", "mistral/mistral-small-latest", "https://api.mistral.ai/v1", "MISTRAL_API_KEY", ["answering"], 70)
     register_provider("cohere", "cohere/command-r", "https://api.cohere.ai/v1", "COHERE_API_KEY", ["answering"], 80)
 
     registry.register(BaseProvider("mock", "mock", "", "", ["text_generation"], 999))
     return registry
+
+
+class SessionContext:
+    """Rolling window of recent goal/response exchanges for the whole
+    session -- separate from the per-task 'history' used inside the code
+    review loop. Without this, every new goal is a blank slate: a
+    follow-up like 'in terms of X' has no idea what X is a follow-up to."""
+
+    def __init__(self, max_turns=3):
+        self.max_turns = max_turns
+        self.turns = []  # list of {"goal": str, "kind": str, "summary": str}
+
+    def add(self, goal, kind, summary):
+        summary = (summary or "").strip()
+        if len(summary) > 300:
+            summary = summary[:300] + "..."
+        self.turns.append({"goal": goal, "kind": kind, "summary": summary})
+        self.turns = self.turns[-self.max_turns:]
+
+    def reset(self):
+        self.turns = []
+
+    def as_context(self):
+        if not self.turns:
+            return ""
+        lines = ["Recent conversation (for context on follow-up questions):"]
+        for t in self.turns:
+            lines.append(f"- User asked: {t['goal']}")
+            if t["summary"]:
+                lines.append(f"  Response summary: {t['summary']}")
+        return "\n".join(lines) + "\n\n"
+
+
+# Continuation phrases that signal "this is a follow-up to what I just
+# asked", not a fresh task -- the plain keyword list below missed these
+# (e.g. "in terms of ai token provider?" doesn't start with what/how/etc,
+# so it was falling through to the coding path instead of answering).
+CONTINUATION_PREFIXES = [
+    "in terms of", "in term of", "what about", "how about", "and ",
+    "also ", "regarding", "about ", "for ", "with respect to", "so ",
+    "but ", "ok so", "okay so",
+]
+
+
+def is_question_or_followup(goal, session):
+    question_keywords = ["what", "how", "why", "when", "where", "who", "is", "are",
+                          "can", "do", "does", "will", "would", "could", "should"]
+    lowered = goal.lower()
+    if any(lowered.startswith(kw) for kw in question_keywords) and len(goal.split()) > 2:
+        return True
+    if any(lowered.startswith(p) for p in CONTINUATION_PREFIXES):
+        return True
+    # A short fragment with no action verb, right after a prior turn, is
+    # almost always a continuation rather than a brand-new coding task.
+    action_verbs = ["write", "make", "build", "create", "generate", "script",
+                    "code", "check", "fix", "add", "implement", "run"]
+    if session.turns and len(goal.split()) <= 6 and not any(v in lowered for v in action_verbs):
+        return True
+    return False
 
 
 def main():
@@ -655,9 +733,10 @@ def main():
     workspace = WorkspaceManager()
     router = MemoryRouter(memory_db)
     replay_manager = ReplayManager(memory_db, workspace)
+    session = SessionContext()
 
     while True:
-        goal = input("\nYour goal/question (or 'exit', or 'providers' to see rankings): ").strip()
+        goal = input("\nYour goal/question (or 'exit', 'providers', 'reset' to clear context): ").strip()
         if not goal:
             continue
         if goal.lower() in ("exit", "quit"):
@@ -665,6 +744,10 @@ def main():
             break
         if goal.lower() == "providers":
             print_provider_rankings(registry, memory_db)
+            continue
+        if goal.lower() == "reset":
+            session.reset()
+            print("Conversation context cleared.")
             continue
 
         task_id = f"task_{uuid.uuid4().hex[:8]}"
@@ -693,26 +776,29 @@ def main():
                         print("Replay failed, falling back to fresh generation.")
             # 'n' or replay failed or depth exceeded -> fall through to fresh generation
 
-        question_keywords = ["what", "how", "why", "when", "where", "who", "is", "are",
-                              "can", "do", "does", "will", "would", "could", "should"]
-        is_question = any(goal.lower().startswith(kw) for kw in question_keywords) and len(goal.split()) > 2
+        is_question = is_question_or_followup(goal, session)
 
         if is_question:
             candidates = registry.get_all("answering", memory_db=memory_db)
             if not candidates:
                 print("No provider configured for answering.")
                 continue
+            context = session.as_context()
+            prompt = f"{context}New message: {goal}" if context else goal
             for provider in candidates:
                 try:
                     answer = stream_generate(
-                        provider, goal,
-                        system_prompt="You are a helpful assistant. Answer concisely and accurately.",
+                        provider, prompt,
+                        system_prompt="You are a helpful assistant. Answer concisely and accurately. "
+                                       "If recent conversation context is given, treat the new message as a "
+                                       "follow-up to it unless it clearly changes topic.",
                         max_tokens=512, label="Thinking",
                         memory_db=memory_db, capability="answering",
                     )
                     memory_db.save_task(task_id=task_id, goal=goal, plan=None, code=None,
                                          answer=answer, provider=provider.name,
                                          workspace_path=str(workspace.create_workspace(task_id)), success=True)
+                    session.add(goal, "answer", answer)
                     break
                 except Exception as e:
                     print(f"Provider {provider.name} failed: {e}")
@@ -726,7 +812,9 @@ def main():
             print("No provider configured for planning/coding.")
             continue
 
-        plan = stream_generate(planner, f"Create a short, clear, numbered plan for: {goal}",
+        context = session.as_context()
+        plan_prompt = f"{context}Create a short, clear, numbered plan for: {goal}"
+        plan = stream_generate(planner, plan_prompt,
                                 max_tokens=1024, label="Planning", memory_db=memory_db, capability="planning")
         workspace.save_plan(ws_path, plan)
 
@@ -736,6 +824,7 @@ def main():
             print("\nTask completed and saved to memory.")
             memory_db.save_task(task_id=task_id, goal=goal, plan=plan, code=code, answer=stdout,
                                  provider=provider, workspace_path=str(ws_path), success=True)
+            session.add(goal, "code", f"Wrote and ran code for: {goal}. Output: {stdout[:150]}")
         else:
             print("\nTask skipped or not completed.")
             memory_db.save_task(task_id=task_id, goal=goal, plan=plan, code=code or "",
