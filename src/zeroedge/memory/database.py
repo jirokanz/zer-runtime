@@ -1,4 +1,6 @@
+import json
 import sqlite3
+
 
 class MemoryDatabase:
     def __init__(self, path=":memory:"):
@@ -10,16 +12,19 @@ class MemoryDatabase:
                 success BOOLEAN,
                 replay_count INTEGER DEFAULT 0,
                 replay_success_count INTEGER DEFAULT 0,
+                replay_depth INTEGER DEFAULT 0,
                 archived BOOLEAN DEFAULT 0,
+                workspace_path TEXT,
                 metadata TEXT
             )
         """)
         self.conn.commit()
 
-    def record_task(self, task_id, goal, success=False, workspace_path=None):
+    def record_task(self, task_id, goal, success=False, workspace_path=None, replay_depth=0):
         self.conn.execute(
-            "INSERT OR REPLACE INTO tasks (id, goal, success) VALUES (?, ?, ?)",
-            (task_id, goal, success)
+            "INSERT OR REPLACE INTO tasks (id, goal, success, workspace_path, replay_depth) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (task_id, goal, success, workspace_path, replay_depth)
         )
         self.conn.commit()
 
@@ -33,14 +38,18 @@ class MemoryDatabase:
                 "success": row[2],
                 "replay_count": row[3],
                 "replay_success_count": row[4],
-                "archived": row[5],
-                "metadata": row[6]
+                "replay_depth": row[5],
+                "archived": row[6],
+                "workspace_path": row[7],
+                "metadata": row[8],
             }
         return None
 
     def find_similar_goals(self, goal, limit=3):
         words = set(goal.lower().split())
-        cursor = self.conn.execute("SELECT id, goal, success, replay_count, replay_success_count FROM tasks")
+        cursor = self.conn.execute(
+            "SELECT id, goal, success, replay_count, replay_success_count, replay_depth, archived FROM tasks"
+        )
         candidates = []
         for row in cursor.fetchall():
             task_words = set(row[1].lower().split())
@@ -52,13 +61,14 @@ class MemoryDatabase:
                     "success": row[2],
                     "replay_count": row[3],
                     "replay_success_count": row[4],
-                    "similarity": similarity
+                    "replay_depth": row[5],
+                    "archived": row[6],
+                    "similarity": similarity,
                 })
         candidates.sort(key=lambda x: x["similarity"], reverse=True)
         return candidates[:limit]
 
     def update_task_metadata(self, task_id, metadata):
-        import json
         self.conn.execute(
             "UPDATE tasks SET metadata = ? WHERE id = ?",
             (json.dumps(metadata), task_id)
