@@ -717,12 +717,18 @@ def build_registry():
     #                    capability_priority={"coding": 5})
     register_provider("openrouter", "openrouter/meta-llama/llama-3.1-70b-instruct", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", ["answering", "planning"], 30)
     register_provider("gemini", "gemini/gemini-2.0-flash", "https://generativelanguage.googleapis.com/v1beta/openai/", "GEMINI_API_KEY", ["answering", "validation"], 40)
-    register_provider("nvidia", "nvidia/llama-3.1-70b-instruct", "https://integrate.api.nvidia.com/v1", "NVIDIA_API_KEY", ["planning", "coding"], 50)
+    # NVIDIA NIM removed for now -- its free access is a "hosted evaluation
+    # endpoint" rather than a confirmed indefinite production free tier.
+    # Re-add if you verify your own account's limits are workable:
+    # register_provider("nvidia", "nvidia/llama-3.1-70b-instruct", "https://integrate.api.nvidia.com/v1", "NVIDIA_API_KEY", ["planning", "coding"], 50)
     # Upgraded from llama3.1-8b -- an 8B model was too weak to be a
     # meaningful answering fallback; 70B is Cerebras's strong offering.
     register_provider("cerebras", "cerebras/llama-3.3-70b", "https://api.cerebras.ai/v1", "CEREBRAS_API_KEY", ["answering"], 60)
     register_provider("mistral", "mistral/mistral-small-latest", "https://api.mistral.ai/v1", "MISTRAL_API_KEY", ["answering"], 70)
-    register_provider("cohere", "cohere/command-r", "https://api.cohere.ai/v1", "COHERE_API_KEY", ["answering"], 80)
+    # Cohere removed for now -- same "free evaluation limits" trial flavor
+    # as NVIDIA above, not a clearly indefinite free tier. Re-add if
+    # verified workable on your account:
+    # register_provider("cohere", "cohere/command-r", "https://api.cohere.ai/v1", "COHERE_API_KEY", ["answering"], 80)
 
     registry.register(BaseProvider("mock", "mock", "", "", ["text_generation"], 999))
     return registry
