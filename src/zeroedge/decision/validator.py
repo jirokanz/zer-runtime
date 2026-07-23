@@ -1,6 +1,6 @@
 """ExecutionPlan validator.""" 
 
-from .types import ExecutionAction, ExecutionPlan
+from zeroedge.decision.types import ExecutionAction, ExecutionPlan
 
 class ExecutionPlanError(Exception):
     pass

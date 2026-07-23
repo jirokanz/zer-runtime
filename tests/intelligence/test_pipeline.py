@@ -1,8 +1,8 @@
 """Test IntelligencePipeline.""" 
 
 from unittest.mock import Mock
-from src.zeroedge.intelligence.pipeline import IntelligencePipeline, IntelligenceResult
-from src.zeroedge.decision.types import ExecutionAction
+from zeroedge.intelligence.pipeline import IntelligencePipeline, IntelligenceResult
+from zeroedge.decision.types import ExecutionAction
 
 def test_pipeline_orchestration():
     mock_classifier = Mock()

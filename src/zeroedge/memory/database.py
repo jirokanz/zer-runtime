@@ -5,9 +5,9 @@ from typing import List, Optional
 from datetime import datetime
 from pathlib import Path
 
-from .models import MemoryRecord, MemoryCandidate
-from .migration_manager import MigrationManager
-from ..core.version import ZER_VERSION, get_major_version
+from zeroedge.memory.models import MemoryRecord, MemoryCandidate
+from zeroedge.memory.migration_manager import MigrationManager
+from zeroedge.core.version import ZER_VERSION, get_major_version
 
 class MemoryDB:
     def __init__(self, db_path: str = "memory.db"):

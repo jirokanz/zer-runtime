@@ -2,8 +2,8 @@
 
 from typing import Dict, Any
 
-from ..decision.types import ExecutionAction, ExecutionPlan
-from .executors import BaseExecutor, MockMemoryExecutor, MockAdaptationExecutor, MockGenerationExecutor
+from zeroedge.decision.types import ExecutionAction, ExecutionPlan
+from zeroedge.execution.executors import BaseExecutor, MockMemoryExecutor, MockAdaptationExecutor, MockGenerationExecutor
 
 class ExecutionDispatcher:
     def __init__(self, memory_executor: BaseExecutor = None, adapt_executor: BaseExecutor = None, gen_executor: BaseExecutor = None):

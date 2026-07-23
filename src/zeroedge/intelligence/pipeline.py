@@ -2,11 +2,11 @@
 
 from dataclasses import dataclass
 
-from .classifier import TaskClassifier
-from .types import TaskProfile, ReuseDecision
-from ..memory.router import MemoryRouter
-from ..decision.engine import DecisionEngine
-from ..decision.types import ExecutionPlan
+from zeroedge.intelligence.classifier import TaskClassifier
+from zeroedge.intelligence.types import TaskProfile, ReuseDecision
+from zeroedge.memory.router import MemoryRouter
+from zeroedge.decision.engine import DecisionEngine
+from zeroedge.decision.types import ExecutionPlan
 
 @dataclass
 class IntelligenceResult:

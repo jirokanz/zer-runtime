@@ -3,11 +3,11 @@
 from datetime import datetime
 from typing import List, Optional
 
-from .types import TaskProfile, ReuseDecision, RecommendedStrategy
-from .trace import DecisionTrace
-from ..memory.database import MemoryDB
-from ..memory.models import MemoryCandidate
-from ..providers.registry import ProviderRegistry
+from zeroedge.intelligence.types import TaskProfile, ReuseDecision, RecommendedStrategy
+from zeroedge.intelligence.trace import DecisionTrace
+from zeroedge.memory.database import MemoryDB
+from zeroedge.memory.models import MemoryCandidate
+from zeroedge.providers.registry import ProviderRegistry
 
 class MemoryRouter:
     def __init__(self, memory_db: MemoryDB, provider_registry: ProviderRegistry):

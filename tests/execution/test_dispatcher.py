@@ -1,7 +1,7 @@
 """Test ExecutionDispatcher.""" 
 
-from src.zeroedge.execution.dispatcher import ExecutionDispatcher
-from src.zeroedge.decision.types import ExecutionAction, ExecutionPlan
+from zeroedge.execution.dispatcher import ExecutionDispatcher
+from zeroedge.decision.types import ExecutionAction, ExecutionPlan
 
 def test_dispatcher_memory():
     plan = ExecutionPlan(ExecutionAction.EXECUTE_MEMORY, None, "mem", False, False, False, "x")

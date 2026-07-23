@@ -1,6 +1,6 @@
 """TaskClassifier - Heuristic-based, zero-LLM cost.""" 
 
-from .types import TaskProfile, TaskCategory, RiskLevel, RecommendedStrategy
+from zeroedge.intelligence.types import TaskProfile, TaskCategory, RiskLevel, RecommendedStrategy
 
 class TaskClassifier:
     COMPLEXITY_KEYWORDS = {

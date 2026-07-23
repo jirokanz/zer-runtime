@@ -3,7 +3,7 @@
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import List, Optional
-from .trace import DecisionTrace
+from zeroedge.intelligence.trace import DecisionTrace
 
 class TaskCategory(Enum):
     CODING = "coding"
