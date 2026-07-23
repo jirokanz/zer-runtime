@@ -17,8 +17,19 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+# Must be set before litellm/huggingface_hub get imported, or the progress
+# bar for the one-off tokenizer download (litellm falls back to an HF
+# tokenizer to count tokens for models it doesn't recognize, e.g. some
+# groq/llama routes) prints a raw tqdm bar straight into the terminal.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
 from dotenv import load_dotenv
 import litellm
+
+litellm.suppress_debug_info = True
+litellm.set_verbose = False
 
 from zeroedge.tools.python.security import validate_code as static_validate_code
 from zeroedge.tools.python.limits import make_preexec_fn, enforce_output_limit
@@ -31,6 +42,67 @@ WORKSPACE_ROOT = Path.home() / "zer-runtime" / "workspace"
 MAX_FIX_ATTEMPTS = 3
 EXECUTION_TIMEOUT = 20
 MAX_OUTPUT_BYTES = 1_048_576
+
+# ---------- Terminal formatting ----------
+_ANSI = {
+    "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m",
+    "cyan": "\033[36m", "green": "\033[32m", "yellow": "\033[33m",
+    "magenta": "\033[35m", "red": "\033[31m", "grey": "\033[90m",
+}
+_USE_COLOR = sys.stdout.isatty()
+
+_PY_KEYWORDS = {
+    "def", "class", "return", "if", "elif", "else", "for", "while", "in",
+    "import", "from", "as", "with", "try", "except", "finally", "raise",
+    "pass", "break", "continue", "yield", "lambda", "None", "True", "False",
+    "and", "or", "not", "is", "global", "nonlocal", "assert", "async", "await",
+}
+
+
+def _c(text, color):
+    if not _USE_COLOR:
+        return text
+    return f"{_ANSI[color]}{text}{_ANSI['reset']}"
+
+
+_STRING_RE = re.compile(r"""('[^'\\]*(?:\\.[^'\\]*)*'|"[^"\\]*(?:\\.[^"\\]*)*")""")
+
+
+def _highlight_line(line):
+    if not _USE_COLOR:
+        return line
+    stripped = line.strip()
+    if stripped.startswith("#"):
+        return _c(line, "grey")
+
+    # Pull out string literals first so the word-splitter below doesn't
+    # tear them apart before a color can be applied.
+    parts = _STRING_RE.split(line)
+    out = []
+    for i, part in enumerate(parts):
+        if i % 2 == 1:  # captured string literal
+            out.append(_c(part, "green"))
+            continue
+        for tok in re.split(r"(\W+)", part):
+            out.append(_c(tok, "magenta") if tok in _PY_KEYWORDS else tok)
+    return "".join(out)
+
+
+def format_code_block(code, title="code"):
+    """Boxed, line-numbered, lightly syntax-highlighted code display --
+    replaces the old bare `print(code)` wall of text."""
+    lines = code.splitlines() or [""]
+    width = max((len(l) for l in lines), default=0)
+    width = min(max(width, len(title)), 100)
+    bar = "─" * (width + 6)
+    out = [f"\n{_c('┌' + bar + '┐', 'dim')}", f"{_c('│', 'dim')} {_c(title, 'bold')}"]
+    out.append(_c("├" + bar + "┤", "dim"))
+    gutter_width = len(str(len(lines)))
+    for i, line in enumerate(lines, 1):
+        num = str(i).rjust(gutter_width)
+        out.append(f"{_c(num, 'grey')} {_c('│', 'dim')} {_highlight_line(line)}")
+    out.append(_c("└" + bar + "┘", "dim"))
+    return "\n".join(out)
 
 
 # ---------- Code extraction ----------
@@ -316,20 +388,36 @@ def show_diff(old_code, new_code):
             print(line)
 
 
-def stream_generate(provider, prompt, system_prompt=None, max_tokens=1024, history=None, label="Generating"):
-    """Streams output to the terminal as it's produced (vibe-coding feel),
-    falling back to non-streaming if the provider errors out mid-stream."""
-    print(f"   [{provider.name}] {label}...\n")
+def stream_generate(provider, prompt, system_prompt=None, max_tokens=1024, history=None,
+                     label="Generating", render="text"):
+    """Streams from the provider as it's produced (vibe-coding feel).
+    render='text'  -> print raw chunks live (good for prose: plans, answers)
+    render='code'  -> print a lightweight progress indicator instead of raw
+                       chunks, and let the caller show a formatted code box
+                       once generation is complete (avoids dumping raw,
+                       unhighlighted, possibly-mid-fence text to the screen
+                       and then immediately re-printing the same code)."""
+    print(f"{_c(f'   [{provider.name}] {label}...', 'cyan')}")
     try:
         chunks = []
+        dots = 0
         for chunk in provider.generate_stream(prompt, system_prompt, max_tokens, history):
-            print(chunk, end="", flush=True)
             chunks.append(chunk)
-        print("\n")
+            if render == "text":
+                print(chunk, end="", flush=True)
+            else:
+                dots += 1
+                if dots % 20 == 0:
+                    print(".", end="", flush=True)
+        if render == "text":
+            print("\n")
+        else:
+            print(" done\n")
         return "".join(chunks)
     except Exception:
         result = provider.generate(prompt, system_prompt, max_tokens, history)
-        print(result["content"] + "\n")
+        if render == "text":
+            print(result["content"] + "\n")
         return result["content"]
 
 
@@ -361,16 +449,14 @@ def run_with_autofix_interactive(goal, plan, coder, workspace, memory_db, task_i
     ws_path = workspace.root / f"task_{task_id}"
 
     gen_prompt = f"Write Python code for this goal:\nGoal: {goal}\nPlan: {plan}\n\nOutput only the code, no explanation."
-    raw = stream_generate(coder, gen_prompt, max_tokens=1024, label="Generating code")
+    raw = stream_generate(coder, gen_prompt, max_tokens=1024, label="Generating code", render="code")
     code = extract_code(raw)
     provider = coder.name
     history.append({"role": "user", "content": gen_prompt})
     history.append({"role": "assistant", "content": raw})
 
     while True:
-        print("\n--- current code ---")
-        print(code)
-        print("---------------------")
+        print(format_code_block(code, title=f"{goal[:60]}"))
 
         action = ask_action()
 
@@ -391,7 +477,7 @@ def run_with_autofix_interactive(goal, plan, coder, workspace, memory_db, task_i
         if action == "f":
             feedback = input("What should change? ").strip()
             fix_prompt = f"The current code for goal '{goal}' needs this change:\n{feedback}\n\nCurrent code:\n{code}\n\nOutput only the corrected full code."
-            raw = stream_generate(coder, fix_prompt, max_tokens=1024, history=history, label="Applying feedback")
+            raw = stream_generate(coder, fix_prompt, max_tokens=1024, history=history, label="Applying feedback", render="code")
             new_code = extract_code(raw)
             print("Diff vs. previous version:")
             show_diff(code, new_code)
@@ -411,19 +497,19 @@ def run_with_autofix_interactive(goal, plan, coder, workspace, memory_db, task_i
             workspace.save_execution(ws_path, stdout, stderr, exit_code)
 
             if exit_code == 0:
-                print("Execution succeeded.")
+                print(_c("Execution succeeded.", "green"))
                 if stdout:
                     print(f"Output:\n{stdout}")
                 return code, stdout, stderr, provider
 
-            print(f"Execution failed (exit code {exit_code}).")
+            print(_c(f"Execution failed (exit code {exit_code}).", "red"))
             if stderr:
                 print(f"Error: {stderr[:300]}")
             if attempt == MAX_FIX_ATTEMPTS - 1:
                 break
 
             fix_prompt = f"The Python code for goal '{goal}' failed:\n\n{stderr}\n\nCurrent code:\n{code}\n\nOutput only the corrected code."
-            raw = stream_generate(coder, fix_prompt, max_tokens=1024, history=history, label=f"Auto-fixing (attempt {attempt + 1})")
+            raw = stream_generate(coder, fix_prompt, max_tokens=1024, history=history, label=f"Auto-fixing (attempt {attempt + 1})", render="code")
             new_code = extract_code(raw)
             show_diff(code, new_code)
             history.append({"role": "user", "content": fix_prompt})
