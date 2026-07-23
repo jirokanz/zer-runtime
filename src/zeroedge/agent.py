@@ -36,6 +36,8 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 from zeroedge.tools.python.security import validate_code as static_validate_code
 from zeroedge.tools.python.limits import make_preexec_fn, enforce_output_limit
+from zeroedge.intelligence.classifier import TaskClassifier
+from zeroedge.intelligence.types import RiskLevel
 
 load_dotenv()
 
@@ -247,6 +249,7 @@ class MemoryDB:
                 calls INTEGER DEFAULT 0,
                 successes INTEGER DEFAULT 0,
                 total_latency_ms REAL DEFAULT 0,
+                total_cost_usd REAL DEFAULT 0,
                 PRIMARY KEY (provider, capability)
             )
         """)
@@ -259,38 +262,52 @@ class MemoryDB:
         required = {
             "plan": "TEXT", "code": "TEXT", "answer": "TEXT", "success": "BOOLEAN",
             "provider": "TEXT", "workspace_path": "TEXT", "replay_depth": "INTEGER DEFAULT 0",
+            "cost_usd": "REAL DEFAULT 0",
         }
         for col, col_type in required.items():
             if col not in existing:
                 self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {col_type}")
                 self.conn.commit()
 
-    def record_provider_call(self, provider, capability, success, latency_ms):
+        cur = self.conn.execute("PRAGMA table_info(provider_stats)")
+        existing_ps = [row[1] for row in cur.fetchall()]
+        if "total_cost_usd" not in existing_ps:
+            self.conn.execute("ALTER TABLE provider_stats ADD COLUMN total_cost_usd REAL DEFAULT 0")
+            self.conn.commit()
+
+    def record_provider_call(self, provider, capability, success, latency_ms, cost_usd=0.0):
         self.conn.execute(
-            "INSERT INTO provider_stats (provider, capability, calls, successes, total_latency_ms) "
-            "VALUES (?, ?, 1, ?, ?) "
+            "INSERT INTO provider_stats (provider, capability, calls, successes, total_latency_ms, total_cost_usd) "
+            "VALUES (?, ?, 1, ?, ?, ?) "
             "ON CONFLICT(provider, capability) DO UPDATE SET "
             "calls = calls + 1, "
             "successes = successes + ?, "
-            "total_latency_ms = total_latency_ms + ?",
-            (provider, capability, int(success), latency_ms, int(success), latency_ms),
+            "total_latency_ms = total_latency_ms + ?, "
+            "total_cost_usd = total_cost_usd + ?",
+            (provider, capability, int(success), latency_ms, cost_usd,
+             int(success), latency_ms, cost_usd),
         )
         self.conn.commit()
 
     def get_provider_stats(self, provider, capability):
         cur = self.conn.execute(
-            "SELECT calls, successes, total_latency_ms FROM provider_stats WHERE provider=? AND capability=?",
+            "SELECT calls, successes, total_latency_ms, total_cost_usd FROM provider_stats WHERE provider=? AND capability=?",
             (provider, capability),
         )
         row = cur.fetchone()
         if not row:
             return None
-        return {"calls": row[0], "successes": row[1], "total_latency_ms": row[2]}
+        return {"calls": row[0], "successes": row[1], "total_latency_ms": row[2], "total_cost_usd": row[3] or 0.0}
+
+    def get_total_cost(self):
+        cur = self.conn.execute("SELECT COALESCE(SUM(total_cost_usd), 0) FROM provider_stats")
+        return cur.fetchone()[0]
 
     def get_all_provider_stats(self):
-        cur = self.conn.execute("SELECT provider, capability, calls, successes, total_latency_ms FROM provider_stats")
+        cur = self.conn.execute("SELECT provider, capability, calls, successes, total_latency_ms, total_cost_usd FROM provider_stats")
         return [
-            {"provider": r[0], "capability": r[1], "calls": r[2], "successes": r[3], "total_latency_ms": r[4]}
+            {"provider": r[0], "capability": r[1], "calls": r[2], "successes": r[3],
+             "total_latency_ms": r[4], "total_cost_usd": r[5] or 0.0}
             for r in cur.fetchall()
         ]
 
@@ -315,12 +332,12 @@ class MemoryDB:
         return best
 
     def save_task(self, task_id, goal, plan, code, answer, provider,
-                  workspace_path=None, success=True, replay_depth=0):
+                  workspace_path=None, success=True, replay_depth=0, cost_usd=0.0):
         self.conn.execute(
             "INSERT OR REPLACE INTO tasks "
-            "(id, goal, plan, code, answer, success, provider, workspace_path, replay_depth) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (task_id, goal, plan, code, answer, success, provider, workspace_path, replay_depth),
+            "(id, goal, plan, code, answer, success, provider, workspace_path, replay_depth, cost_usd) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (task_id, goal, plan, code, answer, success, provider, workspace_path, replay_depth, cost_usd),
         )
         self.conn.commit()
 
@@ -457,7 +474,8 @@ def show_diff(old_code, new_code):
 
 
 def stream_generate(provider, prompt, system_prompt=None, max_tokens=1024, history=None,
-                     label="Generating", render="text", memory_db=None, capability=None):
+                     label="Generating", render="text", memory_db=None, capability=None,
+                     cost_tracker=None):
     """Streams from the provider as it's produced (vibe-coding feel).
     render='text'  -> print raw chunks live (good for prose: plans, answers)
     render='code'  -> print a lightweight progress indicator instead of raw
@@ -465,13 +483,16 @@ def stream_generate(provider, prompt, system_prompt=None, max_tokens=1024, histo
                        once generation is complete (avoids dumping raw,
                        unhighlighted, possibly-mid-fence text to the screen
                        and then immediately re-printing the same code).
-    If memory_db + capability are given, records success/latency so
+    If memory_db + capability are given, records success/latency/cost so
     ProviderRegistry can rank providers by measured performance instead
-    of only the static hardcoded priority."""
+    of only the static hardcoded priority.
+    If cost_tracker (a CostTracker) is given, the estimated cost of this
+    call is added to its running total for the current task."""
     import time
     print(f"{_c(f'   [{provider.name}] {label}...', 'cyan')}")
     start = time.monotonic()
     success = False
+    output_text = ""
     try:
         chunks = []
         dots = 0
@@ -488,21 +509,36 @@ def stream_generate(provider, prompt, system_prompt=None, max_tokens=1024, histo
         else:
             print(" done\n")
         success = True
-        return "".join(chunks)
+        output_text = "".join(chunks)
+        return output_text
     except Exception:
         try:
             result = provider.generate(prompt, system_prompt, max_tokens, history)
             if render == "text":
                 print(result["content"] + "\n")
             success = True
-            return result["content"]
+            output_text = result["content"]
+            return output_text
         except Exception:
             raise
     finally:
-        if memory_db is not None and capability is not None:
-            latency_ms = (time.monotonic() - start) * 1000
+        latency_ms = (time.monotonic() - start) * 1000
+        cost = 0.0
+        if success:
             try:
-                memory_db.record_provider_call(provider.name, capability, success, latency_ms)
+                # completion_cost estimates tokens from the raw text when no
+                # usage object is available (true for our manual streaming
+                # accumulation). Models litellm has no pricing data for
+                # raise/return 0 here -- that means "unknown", not "free".
+                full_prompt = f"{system_prompt}\n{prompt}" if system_prompt else prompt
+                cost = litellm.completion_cost(model=provider.model, prompt=full_prompt, completion=output_text) or 0.0
+            except Exception:
+                cost = 0.0
+        if cost_tracker is not None:
+            cost_tracker.add(cost)
+        if memory_db is not None and capability is not None:
+            try:
+                memory_db.record_provider_call(provider.name, capability, success, latency_ms, cost_usd=cost)
             except Exception:
                 pass  # stats tracking should never break the actual task
 
@@ -524,7 +560,7 @@ def ask_action(prompt="What next?", options=("r", "e", "f", "s")):
         print(f"Please choose one of: {', '.join(options)}")
 
 
-def run_with_autofix_interactive(goal, plan, coder, workspace, memory_db, task_id):
+def run_with_autofix_interactive(goal, plan, coder, workspace, memory_db, task_id, cost_tracker):
     """Interactive plan->code->review loop. Unlike the old one-shot
     generate-and-run, this shows you the code before executing and lets
     you approve, hand-edit, or give free-text feedback to regenerate --
@@ -534,8 +570,13 @@ def run_with_autofix_interactive(goal, plan, coder, workspace, memory_db, task_i
     provider = None
     ws_path = workspace.root / f"task_{task_id}"
 
+    risk_profile = TaskClassifier().classify(goal)
+    if risk_profile.risk != RiskLevel.LOW:
+        kw = ", ".join(risk_profile.keywords) if risk_profile.keywords else "goal wording"
+        print(_c(f"   Risk assessment: {risk_profile.risk.value.upper()} (flagged on: {kw})", "yellow"))
+
     gen_prompt = f"Write Python code for this goal:\nGoal: {goal}\nPlan: {plan}\n\nOutput only the code, no explanation."
-    raw = stream_generate(coder, gen_prompt, max_tokens=1024, label="Generating code", render="code", memory_db=memory_db, capability="coding")
+    raw = stream_generate(coder, gen_prompt, max_tokens=1024, label="Generating code", render="code", memory_db=memory_db, capability="coding", cost_tracker=cost_tracker)
     code = extract_code(raw)
     provider = coder.name
     history.append({"role": "user", "content": gen_prompt})
@@ -563,7 +604,7 @@ def run_with_autofix_interactive(goal, plan, coder, workspace, memory_db, task_i
         if action == "f":
             feedback = input("What should change? ").strip()
             fix_prompt = f"The current code for goal '{goal}' needs this change:\n{feedback}\n\nCurrent code:\n{code}\n\nOutput only the corrected full code."
-            raw = stream_generate(coder, fix_prompt, max_tokens=1024, history=history, label="Applying feedback", render="code", memory_db=memory_db, capability="coding")
+            raw = stream_generate(coder, fix_prompt, max_tokens=1024, history=history, label="Applying feedback", render="code", memory_db=memory_db, capability="coding", cost_tracker=cost_tracker)
             new_code = extract_code(raw)
             print("Diff vs. previous version:")
             show_diff(code, new_code)
@@ -574,6 +615,14 @@ def run_with_autofix_interactive(goal, plan, coder, workspace, memory_db, task_i
 
         if action == "s":
             return None, None, None, None
+
+        if risk_profile.risk == RiskLevel.HIGH:
+            confirm = input(_c(
+                f"   This goal was flagged HIGH RISK. Type 'yes' to run it anyway, anything else to go back: ",
+                "yellow")).strip().lower()
+            if confirm != "yes":
+                print("   Not running. Back to review.")
+                continue
 
         # action == "r": run it, with auto-fix on failure
         for attempt in range(MAX_FIX_ATTEMPTS):
@@ -595,7 +644,7 @@ def run_with_autofix_interactive(goal, plan, coder, workspace, memory_db, task_i
                 break
 
             fix_prompt = f"The Python code for goal '{goal}' failed:\n\n{stderr}\n\nCurrent code:\n{code}\n\nOutput only the corrected code."
-            raw = stream_generate(coder, fix_prompt, max_tokens=1024, history=history, label=f"Auto-fixing (attempt {attempt + 1})", render="code", memory_db=memory_db, capability="coding")
+            raw = stream_generate(coder, fix_prompt, max_tokens=1024, history=history, label=f"Auto-fixing (attempt {attempt + 1})", render="code", memory_db=memory_db, capability="coding", cost_tracker=cost_tracker)
             new_code = extract_code(raw)
             show_diff(code, new_code)
             history.append({"role": "user", "content": fix_prompt})
@@ -626,6 +675,23 @@ def print_provider_rankings(registry, memory_db):
             else:
                 detail = f"no data yet -- using static priority ({p.priority_for(cap)})"
             print(f"    {rank}. {p.name:12s} {_c(detail, 'grey')}")
+
+
+def print_cost_summary(memory_db):
+    total = memory_db.get_total_cost()
+    print(f"\n{_c('Lifetime estimated cost: $' + f'{total:.6f}', 'bold')}")
+    stats = memory_db.get_all_provider_stats()
+    if not stats:
+        print("  (no calls recorded yet)")
+        return
+    stats = [s for s in stats if s["calls"] > 0]
+    stats.sort(key=lambda s: s["total_cost_usd"], reverse=True)
+    print(f"\n  {'provider':12s} {'capability':12s} {'calls':>6s} {'cost':>12s}")
+    for s in stats:
+        cost_str = f"${s['total_cost_usd']:.6f}"
+        print(f"  {s['provider']:12s} {s['capability']:12s} {s['calls']:>6d} {cost_str:>12s}")
+    print(_c("\n  Note: $0.000000 can mean genuinely free OR that litellm has no "
+             "pricing data for that model -- not a guarantee of zero cost.", "grey"))
 
 
 def build_registry():
@@ -660,6 +726,21 @@ def build_registry():
 
     registry.register(BaseProvider("mock", "mock", "", "", ["text_generation"], 999))
     return registry
+
+
+class CostTracker:
+    """Accumulates $ cost across the multiple LLM calls that make up one
+    task (plan + code + N feedback/auto-fix rounds), so it can be shown
+    and saved as a single per-task total."""
+
+    def __init__(self):
+        self.total = 0.0
+        self.calls = 0
+
+    def add(self, cost):
+        if cost:
+            self.total += cost
+        self.calls += 1
 
 
 class SessionContext:
@@ -736,7 +817,7 @@ def main():
     session = SessionContext()
 
     while True:
-        goal = input("\nYour goal/question (or 'exit', 'providers', 'reset' to clear context): ").strip()
+        goal = input("\nYour goal/question (or 'exit', 'providers', 'reset', 'cost'): ").strip()
         if not goal:
             continue
         if goal.lower() in ("exit", "quit"):
@@ -748,6 +829,9 @@ def main():
         if goal.lower() == "reset":
             session.reset()
             print("Conversation context cleared.")
+            continue
+        if goal.lower() == "cost":
+            print_cost_summary(memory_db)
             continue
 
         task_id = f"task_{uuid.uuid4().hex[:8]}"
@@ -785,6 +869,7 @@ def main():
                 continue
             context = session.as_context()
             prompt = f"{context}New message: {goal}" if context else goal
+            cost_tracker = CostTracker()
             for provider in candidates:
                 try:
                     answer = stream_generate(
@@ -793,12 +878,15 @@ def main():
                                        "If recent conversation context is given, treat the new message as a "
                                        "follow-up to it unless it clearly changes topic.",
                         max_tokens=512, label="Thinking",
-                        memory_db=memory_db, capability="answering",
+                        memory_db=memory_db, capability="answering", cost_tracker=cost_tracker,
                     )
                     memory_db.save_task(task_id=task_id, goal=goal, plan=None, code=None,
                                          answer=answer, provider=provider.name,
-                                         workspace_path=str(workspace.create_workspace(task_id)), success=True)
+                                         workspace_path=str(workspace.create_workspace(task_id)), success=True,
+                                         cost_usd=cost_tracker.total)
                     session.add(goal, "answer", answer)
+                    if cost_tracker.total > 0:
+                        print(_c(f"   (cost: ${cost_tracker.total:.6f})", "grey"))
                     break
                 except Exception as e:
                     print(f"Provider {provider.name} failed: {e}")
@@ -812,24 +900,31 @@ def main():
             print("No provider configured for planning/coding.")
             continue
 
+        cost_tracker = CostTracker()
         context = session.as_context()
         plan_prompt = f"{context}Create a short, clear, numbered plan for: {goal}"
         plan = stream_generate(planner, plan_prompt,
-                                max_tokens=1024, label="Planning", memory_db=memory_db, capability="planning")
+                                max_tokens=1024, label="Planning", memory_db=memory_db, capability="planning",
+                                cost_tracker=cost_tracker)
         workspace.save_plan(ws_path, plan)
 
-        code, stdout, stderr, provider = run_with_autofix_interactive(goal, plan, coder, workspace, memory_db, task_id)
+        code, stdout, stderr, provider = run_with_autofix_interactive(
+            goal, plan, coder, workspace, memory_db, task_id, cost_tracker)
+
+        if cost_tracker.total > 0:
+            print(_c(f"Task cost so far: ${cost_tracker.total:.6f} across {cost_tracker.calls} calls", "grey"))
 
         if code and stdout is not None:
             print("\nTask completed and saved to memory.")
             memory_db.save_task(task_id=task_id, goal=goal, plan=plan, code=code, answer=stdout,
-                                 provider=provider, workspace_path=str(ws_path), success=True)
+                                 provider=provider, workspace_path=str(ws_path), success=True,
+                                 cost_usd=cost_tracker.total)
             session.add(goal, "code", f"Wrote and ran code for: {goal}. Output: {stdout[:150]}")
         else:
             print("\nTask skipped or not completed.")
             memory_db.save_task(task_id=task_id, goal=goal, plan=plan, code=code or "",
                                  answer=f"INCOMPLETE: {stderr or ''}", provider=provider or "unknown",
-                                 workspace_path=str(ws_path), success=False)
+                                 workspace_path=str(ws_path), success=False, cost_usd=cost_tracker.total)
 
 
 if __name__ == "__main__":
