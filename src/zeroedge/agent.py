@@ -694,6 +694,37 @@ def print_cost_summary(memory_db):
              "pricing data for that model -- not a guarantee of zero cost.", "grey"))
 
 
+def _fetch_cerebras_models(api_key, timeout=5):
+    import urllib.request
+    import json as _json
+    req = urllib.request.Request(
+        "https://api.cerebras.ai/v1/models",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return _json.loads(resp.read())
+
+
+def pick_cerebras_model(api_key, fetch_fn=_fetch_cerebras_models):
+    """Cerebras's free-tier model catalog is confirmed to change without
+    notice (one documented case: ~12 models down to 2 within months, same
+    NotFoundError we hit live) -- hardcoding a model name is fragile by
+    design. Query the live /v1/models endpoint and pick a workable one
+    instead of guessing. Returns None (caller should skip registering
+    Cerebras this session) if discovery fails or the catalog is empty."""
+    try:
+        data = fetch_fn(api_key)
+        model_ids = [m["id"] for m in data.get("data", [])]
+    except Exception:
+        return None
+    if not model_ids:
+        return None
+    for mid in model_ids:
+        if "llama" in mid.lower():
+            return mid
+    return model_ids[0]
+
+
 def build_registry():
     registry = ProviderRegistry()
 
@@ -716,14 +747,25 @@ def build_registry():
     #                    "DEEPSEEK_API_KEY", ["coding", "planning"], priority=20,
     #                    capability_priority={"coding": 5})
     register_provider("openrouter", "openrouter/meta-llama/llama-3.1-70b-instruct", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", ["answering", "planning"], 30)
-    register_provider("gemini", "gemini/gemini-2.0-flash", "https://generativelanguage.googleapis.com/v1beta/openai/", "GEMINI_API_KEY", ["answering", "validation"], 40)
+    register_provider("gemini", "gemini/gemini-2.5-flash", "https://generativelanguage.googleapis.com/v1beta/openai/", "GEMINI_API_KEY", ["answering", "validation"], 40)
     # NVIDIA NIM removed for now -- its free access is a "hosted evaluation
     # endpoint" rather than a confirmed indefinite production free tier.
     # Re-add if you verify your own account's limits are workable:
     # register_provider("nvidia", "nvidia/llama-3.1-70b-instruct", "https://integrate.api.nvidia.com/v1", "NVIDIA_API_KEY", ["planning", "coding"], 50)
     # Upgraded from llama3.1-8b -- an 8B model was too weak to be a
-    # meaningful answering fallback; 70B is Cerebras's strong offering.
-    register_provider("cerebras", "cerebras/llama-3.3-70b", "https://api.cerebras.ai/v1", "CEREBRAS_API_KEY", ["answering"], 60)
+    # meaningful answering fallback. Model name is discovered live
+    # (see pick_cerebras_model) rather than hardcoded, since Cerebras's
+    # free catalog is known to change without notice.
+    cerebras_key = os.getenv("CEREBRAS_API_KEY")
+    if cerebras_key:
+        cerebras_model = pick_cerebras_model(cerebras_key)
+        if cerebras_model:
+            registry.register(BaseProvider("cerebras", f"cerebras/{cerebras_model}",
+                                            "https://api.cerebras.ai/v1", cerebras_key,
+                                            ["answering"], priority=60))
+        else:
+            print(_c("   Warning: could not discover a working Cerebras model "
+                      "(catalog may have changed) -- skipping Cerebras this session.", "yellow"))
     register_provider("mistral", "mistral/mistral-small-latest", "https://api.mistral.ai/v1", "MISTRAL_API_KEY", ["answering"], 70)
     # Cohere removed for now -- same "free evaluation limits" trial flavor
     # as NVIDIA above, not a clearly indefinite free tier. Re-add if

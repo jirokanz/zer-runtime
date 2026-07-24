@@ -341,3 +341,33 @@ def test_classifier_low_risk_for_benign_goal():
     from zeroedge.intelligence.types import RiskLevel
     profile = TaskClassifier().classify("reverse a string")
     assert profile.risk == RiskLevel.LOW
+
+
+# ---- Cerebras live model discovery (was a hardcoded name that went stale) ----
+
+def test_pick_cerebras_model_prefers_llama():
+    from zeroedge.agent import pick_cerebras_model
+    fake_response = {"data": [{"id": "gpt-oss-120b"}, {"id": "llama-3.3-70b"}, {"id": "zai-glm-4.7"}]}
+    result = pick_cerebras_model("fake-key", fetch_fn=lambda key: fake_response)
+    assert result == "llama-3.3-70b"
+
+
+def test_pick_cerebras_model_falls_back_to_first_when_no_llama():
+    from zeroedge.agent import pick_cerebras_model
+    fake_response = {"data": [{"id": "gpt-oss-120b"}, {"id": "zai-glm-4.7"}]}
+    result = pick_cerebras_model("fake-key", fetch_fn=lambda key: fake_response)
+    assert result == "gpt-oss-120b"
+
+
+def test_pick_cerebras_model_returns_none_on_empty_catalog():
+    from zeroedge.agent import pick_cerebras_model
+    result = pick_cerebras_model("fake-key", fetch_fn=lambda key: {"data": []})
+    assert result is None
+
+
+def test_pick_cerebras_model_returns_none_on_fetch_failure():
+    from zeroedge.agent import pick_cerebras_model
+    def broken_fetch(key):
+        raise ConnectionError("simulated network failure")
+    result = pick_cerebras_model("fake-key", fetch_fn=broken_fetch)
+    assert result is None
